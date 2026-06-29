@@ -2,6 +2,47 @@
 
 ---
 
+## Session 3 — 29 June 2026
+
+### What Was Added — Free Reliability Upgrades (no new API keys)
+
+Three new data sources added to `pipeline.py` to improve CVE accuracy and signal strength without requiring paid or new API keys:
+
+**1. Shodan InternetDB** (`internetdb.shodan.io/{ip}`) — free, no auth
+- Resolves domain → IP via `socket.getaddrinfo`, queries InternetDB for that IP
+- Returns: open ports, version-accurate CVE IDs (Shodan fingerprint-matched), CPE strings, tags
+- When InternetDB has data: switches `data_source` to `live_scan` and looks up the top CVE in NVD by ID (much more accurate than keyword search)
+- CDN detection: if `cloudflare` appears in tags, falls back to keyword search (CDN IP data is useless for target)
+- Impact: for any lead whose IP InternetDB has indexed, CVEs go from "keyword-matched generic" to "version-accurate"
+
+**2. Direct HTTP fingerprinting** (`fingerprint_http()`) — free, no auth
+- `GET https://domain` (fallback to `http://`), 8s timeout, parses `Server:`, `X-Powered-By:`, `X-Generator:`, `via:` headers and first 4KB of HTML
+- Detects: Apache, nginx, IIS, ASP.NET, WordPress, Drupal, Joomla, PHP, Node.js, Cloudflare, Tomcat, OpenSSL
+- Priority 1 in tech stack — more current than VirusTotal passive cache (VT now fallback-only)
+- Impact: better tech stack → better keyword CVE matches for the inferred path
+
+**3. CISA KEV cross-reference** (`load_cisa_kev()`) — free, no auth
+- Downloads CISA Known Exploited Vulnerabilities catalog once per run, caches in memory
+- ~1,100+ CVE IDs that are being actively exploited in the wild
+- After CVE lookup, checks if `top_cve["id"]` is in KEV set
+- Adds `exploited_in_wild = "Yes — CISA KEV"` as a new Lemlist variable
+- Report: adds ⚠ KEV column to lead table, "CISA KEV — actively exploited" badge in lead details
+- Impact: strongest possible signal for outreach — "this CVE is being actively exploited right now"
+
+### New Lemlist variable
+
+`{{exploited_in_wild}}` = `"Yes — CISA KEV"` or `""` (empty)
+
+Use in Step 3 message variant for extra urgency:
+> "Found CVE {{key_cve}} (CVSS {{cvss_score}}) — and it's on CISA's actively exploited list. This one isn't theoretical."
+
+### Other changes this session
+
+- **README.md** — complete rewrite with full product documentation (all 5 phases, CLI flags, variable reference, message templates, API keys, data sources, intel quality, MVP thresholds, roadmap)
+- **context.md** — pipeline state table and data sources updated to reflect 3 new sources; challenges section updated
+
+---
+
 ## Session 2 — 24 June 2026
 
 ### What Was Added
@@ -42,9 +83,9 @@ A Python pipeline (`pipeline.py`) that:
 
 ### 01 — No Shodan API key
 **Original status:** HIGH blocker — no live port/service scanning
-**Resolution:** Attempted replacement with Censys free tier. Censys removed free programmatic API access entirely in June 2026 (their Personal Access Tokens do not grant search API access on free accounts — confirmed by testing all auth methods). Pipeline now runs in **inferred mode** by default: NVD keyword search against likely tech stack, flagged as `data_source: inferred`.
-**Path to live scanning:** Shodan paid membership ($69/mo) is the only reliable option for live port fingerprinting at this price point. VirusTotal free tier (500 req/day) added as lightweight alternative — pulls tech stack hints from cached HTTP response headers.
-**Current impact:** CVEs returned are real but matched to generic tech defaults, not the company's actual stack. Usable for outreach context but not for claiming a specific service is exposed.
+**Session 1–2 resolution:** Attempted replacement with Censys free tier. Censys removed free programmatic API access entirely in June 2026. Pipeline ran in inferred mode with VirusTotal passive headers as tech stack source.
+**Session 3 resolution:** ✅ **Shodan InternetDB** — `internetdb.shodan.io/{ip}` is completely free with no API key. Resolves domain → IP via `socket.getaddrinfo`, returns open ports, version-accurate CVE IDs, CPE strings. For leads where InternetDB has data, `data_source` becomes `live_scan` and CVEs are version-accurate.
+**Remaining gap:** Hosts behind Cloudflare/CDN show CDN IP data — pipeline detects this and falls back to keyword search. Shodan paid ($69/mo) reaches origin servers through CDN for full coverage.
 
 ---
 
@@ -70,8 +111,9 @@ A Python pipeline (`pipeline.py`) that:
 
 ### 05 — CVE lookups imprecise without software versions
 **Original status:** MEDIUM — keyword search returns broad/irrelevant CVEs
-**Resolution:** Partially addressed. Added `cvssV3Severity=HIGH` and `pubStartDate` (3 years back) filters to NVD queries — this eliminates ancient CVEs (1999–2000 era) from results. Tech stack is still generic defaults when no live scan data exists.
-**Path to full fix:** VirusTotal passive HTTP headers give Server/X-Powered-By hints that narrow tech stack. Shodan paid gives version-accurate banners. BuiltWith API gives full tech stack per domain including framework versions.
+**Session 1–2 resolution:** Added HIGH/CRITICAL filters and 3-year recency window to NVD. VirusTotal passive headers narrowed tech stack for most leads.
+**Session 3 resolution:** ✅ Three-layer fix: (1) direct HTTP probe reads `Server:`/`X-Powered-By:` directly (most current), (2) Shodan InternetDB returns CPE strings + CVE IDs matched to the actual IP's fingerprint (version-accurate for indexed hosts), (3) NVD lookup by specific CVE ID when InternetDB has them — much more accurate than keyword search.
+**Remaining gap:** CDN-fronted sites and IPs not in InternetDB still use keyword search. BuiltWith API gives framework versions for sharper CPE-based lookups (paid, post-MVP).
 
 ---
 
@@ -100,32 +142,38 @@ A Python pipeline (`pipeline.py`) that:
 
 ---
 
-## New Challenge: Censys API Removed (not in June 18 report)
+## Challenge: Censys API Removed (not in June 18 report)
 
 **Discovered:** 22 June 2026, during implementation
 **Impact:** HIGH — originally planned as the Shodan replacement
-**Details:** Censys migrated entirely to `platform.censys.io`. All classic API credentials (ID + Secret) are gone. Personal Access Tokens issued by the new platform return 401 on all search endpoints (`app.censys.io/api/v2/`, `platform.censys.io/api/v2/`). Free programmatic access to Censys search is no longer available.
-**Workaround in place:** VirusTotal free tier (500 req/day) added as lightweight tech stack enrichment. Pipeline continues in inferred mode without live scanning.
-**Permanent fix:** Shodan paid ($69/mo) for live port scanning. Worth it at scale once MVP metrics are hit.
+**Details:** Censys migrated entirely to `platform.censys.io`. All classic API credentials (ID + Secret) are gone. Free programmatic access to Censys search is no longer available.
+**Session 1–2 workaround:** VirusTotal free tier added as lightweight tech stack enrichment. Pipeline ran in inferred mode.
+**Session 3 resolution:** ✅ **Shodan InternetDB** (`internetdb.shodan.io/{ip}`) — completely free, no API key, returns live ports + CVE IDs + CPEs. Provides real live scan data for most internet-facing hosts. `scan_censys()` remains in the codebase but is superseded by `query_shodan_internetdb()`.
+**Remaining gap:** Shodan paid ($69/mo) gives deeper service fingerprinting and reaches CDN-protected origins. Worth it post-MVP.
 
 ---
 
-## Intel Quality Assessment — Current State
+## Intel Quality Assessment — Current State (updated 29 June 2026)
 
 **What works:**
 - Domain resolution: 100% accurate (from email)
-- NVD CVE lookup: operational, with retry logic
+- Shodan InternetDB: live ports + version-accurate CVE IDs for indexed IPs (free, no key)
+- Direct HTTP fingerprinting: tech stack from `Server:`/`X-Powered-By:`/HTML (free, no key)
+- CISA KEV cross-reference: actively-exploited flag per CVE (free, no key)
+- NVD CVE lookup: operational, retry logic, HIGH/CRITICAL only, last 3 years
+- VirusTotal tech stack: active, used as fallback
+- SSL Labs + Whois: active
 - Lead tagging: `has_cve` / `has_breach` / `no_findings` working
-- Lemlist variable writeback: implemented, tested against API
+- Lemlist variable writeback: 11 variables including `{{exploited_in_wild}}`
 
 **What needs attention:**
 
 | Issue | Impact | Fix |
 |---|---|---|
-| CVEs matched to generic tech defaults | Medium — findings are real but not company-specific | VirusTotal key for passive tech stack, or Shodan paid for live scan |
-| No breach data | Medium — `breach_date` / `compliance_flag` always empty without HIBP key | HIBP API key (~$4/mo) |
-| NVD slow without API key | Low — 7min runtime acceptable for 23 leads | Free NVD key, 5 min to get |
-| Campaign not activated | Blocking — no outreach sent yet | Manual step in Lemlist UI |
+| No breach data | Medium — `breach_date` / `compliance_flag` always empty | HIBP API key (~$4/mo) |
+| NVD slow without API key | Low — ~7min runtime | Free NVD key, 5 min to get |
+| CDN-fronted hosts | Low — InternetDB returns CDN data, falls back to keyword search | Shodan paid ($69/mo) post-MVP |
+| Campaign not activated | Blocking — no outreach sent yet | Activate in Lemlist UI |
 
 ---
 
@@ -144,7 +192,7 @@ A Python pipeline (`pipeline.py`) that:
 → This is the blocker for any outreach to happen
 
 **3. ~~Get free VirusTotal API key~~ ✓ Done (24 June 2026)**
-→ Key configured in `.env`. Pipeline now uses real passive HTTP headers per domain.
+→ Key configured in `.env`. Now used as fallback only — HTTP fingerprinting runs first.
 
 **4. ~~SSL Labs integration~~ ✓ Done (24 June 2026)**
 → `query_ssl_labs()` added. Pulls SSL grade + cert expiry from cache. No key needed.
@@ -152,21 +200,24 @@ A Python pipeline (`pipeline.py`) that:
 **5. ~~Whois integration~~ ✓ Done (24 June 2026)**
 → `query_whois()` added. Domain age + registrar via system CLI. Handles EU TLDs.
 
+**6. ~~Shodan InternetDB~~ ✓ Done (29 June 2026)**
+→ `query_shodan_internetdb()` added. Free, no key. Live ports + CVE IDs for indexed IPs.
+
+**7. ~~Direct HTTP fingerprinting~~ ✓ Done (29 June 2026)**
+→ `fingerprint_http()` added. Parses `Server:`/`X-Powered-By:`/HTML directly. Priority 1 tech source.
+
+**8. ~~CISA KEV cross-reference~~ ✓ Done (29 June 2026)**
+→ `load_cisa_kev()` added. Flags CVEs on CISA's actively-exploited list. New `{{exploited_in_wild}}` variable.
+
 ### Soon (paid or ~1hr effort)
 
-**6. HIBP API key (~$4/mo)**
+**9. HIBP API key (~$4/mo)**
 → haveibeenpwned.com/API/Key
 → Unlocks `breach_date` and `compliance_flag` variables for GDPR angle messages
 → Enables `has_breach` tagging and the second message angle
 
-**7. ZoomEye free tier**
-→ Shodan alternative for fingerprinting — 10 free searches/day
-→ Register at zoomeye.hk → add `ZOOMEYE_API_KEY` to `.env`
-→ Evaluate before committing to Shodan paid
-
-**8. Shodan paid ($69/mo)**
-→ Live port/service scanning with version-accurate banners
-→ Enables CPE-based NVD lookups (exact CVE matching per version)
+**10. Shodan paid ($69/mo)**
+→ Deeper live scanning — version-accurate banners for CDN-fronted and less-common hosts
 → Worth it post-MVP once message angles are validated
 
 ### Later (2hrs+ effort)

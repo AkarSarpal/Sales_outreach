@@ -6,6 +6,16 @@ Fetches leads from a Lemlist campaign, enriches each company with
 CVE and breach data, and optionally writes results back as Lemlist
 custom variables.
 
+Data sources (all free, no additional keys required):
+  - Shodan InternetDB  — live ports + CVE IDs per IP (no key)
+  - Direct HTTP        — tech stack from response headers + HTML
+  - CISA KEV           — actively exploited CVE cross-reference (no key)
+  - NVD                — CVE details and CVSS scores
+  - VirusTotal         — passive tech hints from cached headers
+  - SSL Labs           — cached SSL grade (no key)
+  - Whois              — domain age (system CLI)
+  - HIBP               — breach history (key optional)
+
 Usage:
     python pipeline.py                      # dry run, generates report
     python pipeline.py --writeback          # push variables to Lemlist
@@ -18,6 +28,7 @@ import re
 import sys
 import time
 import json
+import socket
 import argparse
 import subprocess
 import requests
@@ -32,10 +43,12 @@ from base64 import b64encode
 
 CAMPAIGN_ID = os.getenv("LEMLIST_CAMPAIGN_ID", "cam_D4cKonCgWRYoNiEDR")
 
-NVD_BASE     = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-HIBP_BASE    = "https://haveibeenpwned.com/api/v3"
-CENSYS_BASE  = "https://search.censys.io/api/v2"
-LEMLIST_BASE = "https://api.lemlist.com/api"
+NVD_BASE        = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+HIBP_BASE       = "https://haveibeenpwned.com/api/v3"
+CENSYS_BASE     = "https://search.censys.io/api/v2"
+LEMLIST_BASE    = "https://api.lemlist.com/api"
+INTERNETDB_BASE = "https://internetdb.shodan.io"
+CISA_KEV_URL    = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
 TECH_STACK_DEFAULTS = [
     "Apache HTTP Server", "nginx", "Microsoft IIS",
@@ -55,8 +68,10 @@ _WHOIS_DATE_FMTS = [
     "%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y",
 ]
 
-# Domains that belong to individuals, not the company
 PERSONAL_EMAIL_DOMAINS = {"gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com"}
+
+# Module-level cache for CISA KEV — loaded once per run
+_KEV_CACHE: set | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -99,15 +114,12 @@ def extract_company(tagline: str, domain: str) -> str:
     or 'CISO @ Mediaire'. Falls back to title-casing the domain root.
     """
     if tagline:
-        # "Title at/@ Company [| extra]"
         m = re.search(r'(?:^|\s)(?:at|@)\s+(.+?)(?:\s*[|·•–].*)?$', tagline, re.IGNORECASE)
         if m:
             name = m.group(1).strip()
-            # Drop anything after secondary delimiter
             name = re.split(r'\s*[|·•–]\s*', name)[0].strip()
             if len(name) > 2:
                 return name
-    # Fall back: title-case the domain root (e.g. minddoc.de → Minddoc)
     root = domain.split(".")[0] if domain else "Unknown"
     return root.replace("-", " ").title()
 
@@ -133,7 +145,6 @@ def fetch_leads(campaign_id: str) -> list[dict]:
     """
     headers = _lemlist_auth()
 
-    # Step 1: get lead stubs (id + contactId only)
     resp = requests.get(
         f"{LEMLIST_BASE}/campaigns/{campaign_id}/leads",
         headers=headers, timeout=30,
@@ -143,7 +154,6 @@ def fetch_leads(campaign_id: str) -> list[dict]:
     if not isinstance(stubs, list):
         stubs = stubs.get("leads", stubs.get("data", []))
 
-    # Step 2: fetch full contact for each stub
     leads = []
     for stub in stubs:
         contact_id = stub.get("contactId")
@@ -189,6 +199,140 @@ def writeback_lead(campaign_id: str, email: str, variables: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# CISA Known Exploited Vulnerabilities — free, no key
+# ---------------------------------------------------------------------------
+
+def load_cisa_kev() -> set:
+    """
+    Return the set of CVE IDs on CISA's Known Exploited Vulnerabilities list.
+    Downloaded once per run and cached. A CVE in this list is being actively
+    exploited in the wild — stronger outreach signal than CVSS score alone.
+    """
+    global _KEV_CACHE
+    if _KEV_CACHE is not None:
+        return _KEV_CACHE
+    try:
+        resp = requests.get(
+            CISA_KEV_URL,
+            timeout=20,
+            headers={"User-Agent": "CyberdebunkIntel/1.0"},
+        )
+        resp.raise_for_status()
+        vulns = resp.json().get("vulnerabilities", [])
+        _KEV_CACHE = {v["cveID"] for v in vulns if "cveID" in v}
+        return _KEV_CACHE
+    except Exception as e:
+        print(f"  [KEV] could not load CISA KEV list: {e}")
+        _KEV_CACHE = set()
+        return _KEV_CACHE
+
+
+# ---------------------------------------------------------------------------
+# Shodan InternetDB — free, no API key required
+# ---------------------------------------------------------------------------
+
+def query_shodan_internetdb(domain: str) -> dict:
+    """
+    Query Shodan InternetDB for the IP behind a domain.
+    Returns open ports, CVE IDs (version-accurate), CPE strings, and tags.
+    Completely free — no API key required.
+
+    Limitation: if the domain is behind Cloudflare or another CDN, the data
+    reflects the CDN's IP, not the origin server. Check 'cloudflare' in tags.
+    """
+    try:
+        ip = socket.getaddrinfo(domain, None, socket.AF_INET)[0][4][0]
+    except Exception:
+        return _no_scan()
+    # Skip RFC-1918 and loopback — not routable on the internet
+    if ip.startswith(("10.", "172.16.", "192.168.", "127.")):
+        return _no_scan()
+    try:
+        resp = requests.get(
+            f"{INTERNETDB_BASE}/{ip}",
+            timeout=10,
+            headers={"User-Agent": "CyberdebunkIntel/1.0"},
+        )
+        if resp.status_code == 404:
+            return _no_scan()
+        if resp.status_code != 200:
+            return _no_scan()
+        data = resp.json()
+        cves  = [v for v in data.get("vulns", []) if v.startswith("CVE-")]
+        ports = data.get("ports", [])
+        return {
+            "ip":          ip,
+            "ports":       ports,
+            "cves":        cves,
+            "cpes":        data.get("cpes", []),
+            "tags":        data.get("tags", []),
+            "hostnames":   data.get("hostnames", []),
+            "services":    [],
+            "banners":     {},
+            "data_source": "live_scan" if (cves or ports) else "inferred",
+        }
+    except Exception as e:
+        print(f"    [InternetDB] error for {domain}: {e}")
+        return _no_scan()
+
+
+def _no_scan() -> dict:
+    return {"ip": "", "ports": [], "cves": [], "cpes": [], "tags": [],
+            "hostnames": [], "services": [], "banners": {}, "data_source": "inferred"}
+
+
+# ---------------------------------------------------------------------------
+# Direct HTTP fingerprinting — free, no key
+# ---------------------------------------------------------------------------
+
+def fingerprint_http(domain: str) -> list[str]:
+    """
+    Detect tech stack by fetching the domain directly and parsing
+    response headers (Server, X-Powered-By, X-Generator) and HTML source.
+    More current than VirusTotal passive cache.
+    """
+    signals = {
+        "Apache HTTP Server": ["apache"],
+        "nginx":              ["nginx"],
+        "Microsoft IIS":      ["iis", "microsoft-iis"],
+        "ASP.NET":            ["asp.net"],
+        "WordPress":          ["wordpress", "wp-content", "wp-json"],
+        "Drupal":             ["drupal"],
+        "Joomla":             ["joomla"],
+        "PHP":                ["php"],
+        "Node.js / Express":  ["node.js", "express"],
+        "Cloudflare":         ["cloudflare"],
+        "OpenSSL":            ["openssl"],
+        "Apache Tomcat":      ["tomcat", "catalina"],
+    }
+    for scheme in ("https", "http"):
+        try:
+            resp = requests.get(
+                f"{scheme}://{domain}",
+                timeout=8,
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; CyberdebunkIntel/1.0)"},
+            )
+            combined = " ".join([
+                resp.headers.get("server", ""),
+                resp.headers.get("x-powered-by", ""),
+                resp.headers.get("x-generator", ""),
+                resp.headers.get("via", ""),
+                resp.text[:4000],
+            ]).lower()
+            found = [t for t, terms in signals.items() if any(s in combined for s in terms)]
+            if found:
+                return found
+            # Got a response but no signals — stop trying schemes
+            return []
+        except requests.exceptions.SSLError:
+            continue  # try http://
+        except Exception:
+            return []
+    return []
+
+
+# ---------------------------------------------------------------------------
 # VirusTotal — passive tech stack hints (free, 500 req/day)
 # ---------------------------------------------------------------------------
 
@@ -206,7 +350,6 @@ def query_virustotal(domain: str) -> list[str]:
         if resp.status_code != 200:
             return []
         data  = resp.json().get("data", {}).get("attributes", {})
-        # Last HTTP response headers often contain Server / X-Powered-By
         headers = data.get("last_http_response_headers", {})
         server  = headers.get("server", "") + " " + headers.get("x-powered-by", "")
         cats    = " ".join(data.get("categories", {}).values())
@@ -294,6 +437,7 @@ def query_whois(domain: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # Censys scanning (free programmatic access removed June 2026 — inferred only)
+# Kept for reference; replaced in practice by query_shodan_internetdb()
 # ---------------------------------------------------------------------------
 
 def scan_censys(domain: str) -> dict:
@@ -325,18 +469,12 @@ def scan_censys(domain: str) -> dict:
         return _no_scan()
 
 
-def _no_scan() -> dict:
-    return {"ports": [], "services": [], "banners": {}, "data_source": "inferred"}
-
-
 # ---------------------------------------------------------------------------
 # NVD CVE lookup
 # ---------------------------------------------------------------------------
 
 def query_nvd(keyword: str, max_results: int = 50) -> list[dict]:
     time.sleep(_nvd_sleep())
-    # pubStartDate causes 503/404 under rate-limiting without an API key.
-    # With a key the endpoint is stable — enable date filtering to get recent CVEs.
     cutoff = datetime.now() - timedelta(days=3 * 365)
     key = os.getenv("NVD_API_KEY", "")
     params = {
@@ -374,11 +512,8 @@ def query_nvd(keyword: str, max_results: int = 50) -> list[dict]:
             descs = cve.get("descriptions", [])
             desc  = next((d["value"] for d in descs if d.get("lang") == "en"), "")
             score, severity = _extract_cvss(cve.get("metrics", {}))
-            # Keep HIGH (>=7.0) and CRITICAL (>=9.0) only
             if score is not None and score < 7.0:
                 continue
-            # Client-side date filter — only when key is present (server already filtered);
-            # without key, pubStartDate and sortOrder are unsupported (NVD 404s).
             if key:
                 pub = cve.get("published", "")
                 if pub and pub < cutoff.strftime("%Y-%m-%d"):
@@ -394,6 +529,36 @@ def query_nvd(keyword: str, max_results: int = 50) -> list[dict]:
     except Exception as e:
         print(f"    [NVD] error for '{keyword}': {e}")
         return []
+
+
+def query_nvd_by_id(cve_id: str) -> dict | None:
+    """Look up a specific CVE by ID. Returns None if not found or not HIGH/CRITICAL."""
+    time.sleep(_nvd_sleep())
+    params = {"cveId": cve_id}
+    key = os.getenv("NVD_API_KEY", "")
+    if key:
+        params["apiKey"] = key
+    try:
+        resp = requests.get(NVD_BASE, params=params, headers=_nvd_headers(), timeout=20)
+        if resp.status_code != 200:
+            return None
+        vulns = resp.json().get("vulnerabilities", [])
+        if not vulns:
+            return None
+        cve   = vulns[0].get("cve", {})
+        descs = cve.get("descriptions", [])
+        desc  = next((d["value"] for d in descs if d.get("lang") == "en"), "")
+        score, severity = _extract_cvss(cve.get("metrics", {}))
+        return {
+            "id":          cve.get("id", cve_id),
+            "description": desc[:300],
+            "cvss_score":  score,
+            "severity":    severity or "HIGH",
+            "keyword":     cve_id,
+        }
+    except Exception as e:
+        print(f"    [NVD] error for '{cve_id}': {e}")
+        return None
 
 
 def _extract_cvss(metrics: dict) -> tuple:
@@ -446,14 +611,15 @@ def query_hibp(domain: str, hibp_key: str = "", months: int = 24) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Tech stack detection
+# Tech stack helpers
 # ---------------------------------------------------------------------------
 
-def detect_tech(censys: dict) -> list[str]:
+def detect_tech(scan: dict) -> list[str]:
+    """Extract tech from Censys-style service/banner data (legacy, rarely used now)."""
     combined = (
-        " ".join(s.lower() for s in censys.get("services", []))
+        " ".join(s.lower() for s in scan.get("services", []))
         + " "
-        + " ".join(str(v).lower() for v in censys.get("banners", {}).values())
+        + " ".join(str(v).lower() for v in scan.get("banners", {}).values())
     )
     signals = {
         "Apache HTTP Server": ["apache", "httpd"],
@@ -471,6 +637,28 @@ def detect_tech(censys: dict) -> list[str]:
     return found or TECH_STACK_DEFAULTS[:3]
 
 
+def _tech_from_cpes(cpes: list[str]) -> list[str]:
+    """Extract human-readable tech names from Shodan CPE strings."""
+    cpe_map = {
+        "apache:http_server": "Apache HTTP Server",
+        "nginx:nginx":        "nginx",
+        "microsoft:iis":      "Microsoft IIS",
+        "wordpress":          "WordPress",
+        "php:php":            "PHP",
+        "openssl:openssl":    "OpenSSL",
+        "apache:tomcat":      "Apache Tomcat",
+        "drupal:drupal":      "Drupal",
+    }
+    found, seen = [], set()
+    for cpe in cpes:
+        cpe_l = cpe.lower()
+        for key, name in cpe_map.items():
+            if key in cpe_l and name not in seen:
+                found.append(name)
+                seen.add(name)
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Lead enrichment
 # ---------------------------------------------------------------------------
@@ -486,46 +674,86 @@ def analyze_lead(lead: dict, hibp_key: str = "", verbose: bool = False) -> dict:
         tag       = "no_findings"
         variables = _empty_variables(tag)
         return {**lead, "tech_stack": [], "top_cve": None, "cve_count": 0,
-                "breaches": [], "tag": tag, "data_source": "inferred", "variables": variables}
+                "breaches": [], "tag": tag, "data_source": "inferred",
+                "exploited_in_wild": False, "variables": variables}
 
-    # Censys (inferred only — free API removed June 2026)
-    censys = scan_censys(domain)
-    print(f"    censys: {censys['data_source']}", end="")
-    if censys["data_source"] == "live_scan":
-        print(f" — ports {censys['ports'][:5]}, services {censys['services'][:4]}")
+    # 1. Direct HTTP fingerprinting (free, no key — fastest and most current)
+    http_tech = fingerprint_http(domain)
+    if http_tech and verbose:
+        print(f"    http tech: {http_tech}")
+
+    # 2. Shodan InternetDB (free, no key — real ports + CVE IDs per IP)
+    internetdb = query_shodan_internetdb(domain)
+    is_cdn = "cloudflare" in internetdb.get("tags", []) or "Cloudflare" in (http_tech or [])
+    print(f"    internetdb: {internetdb['data_source']}", end="")
+    if internetdb["data_source"] == "live_scan":
+        cdn_note = " [CDN — origin hidden]" if is_cdn else ""
+        print(f" — {internetdb.get('ip')} "
+              f"ports {internetdb['ports'][:5]} "
+              f"CVEs {len(internetdb['cves'])}{cdn_note}")
     else:
         print()
 
-    # VirusTotal — supplements tech stack when no live scan
-    vt_tech = query_virustotal(domain) if censys["data_source"] == "inferred" else []
-    if vt_tech and verbose:
-        print(f"    vt tech: {vt_tech}")
+    # 3. VirusTotal — supplement tech stack when live scan is absent and http gave nothing
+    vt_tech = []
+    if not http_tech and internetdb["data_source"] == "inferred":
+        vt_tech = query_virustotal(domain)
+        if vt_tech and verbose:
+            print(f"    vt tech: {vt_tech}")
 
-    # SSL Labs — cached grade, no new scan triggered
+    # 4. SSL Labs — cached grade, no new scan triggered
     ssl = query_ssl_labs(domain)
     if ssl.get("grade") and verbose:
         print(f"    ssl grade: {ssl['grade']}  (cert expires {ssl.get('cert_expiry', '?')})")
 
-    # Whois — domain age and registrar
+    # 5. Whois — domain age and registrar
     whois = query_whois(domain)
     if whois.get("age_days") and verbose:
         print(f"    domain age: {whois['age_days'] // 365}y  ({whois.get('registrar', '')})")
 
-    # Tech + CVEs
-    tech     = detect_tech(censys) if censys["data_source"] == "live_scan" else (vt_tech or TECH_STACK_DEFAULTS[:3])
+    # 6. Tech stack — priority: direct HTTP > VirusTotal > CPE strings > defaults
+    cpe_tech = _tech_from_cpes(internetdb.get("cpes", []))
+    tech = http_tech or vt_tech or cpe_tech or TECH_STACK_DEFAULTS[:3]
+
+    # 7. CVEs — live IDs from InternetDB (version-accurate) or keyword search (fallback)
     all_cves = []
-    for t in tech[:6]:
-        cves = query_nvd(t)
-        all_cves.extend(cves)
-        if verbose and cves:
-            print(f"    nvd '{t}': {len(cves)} CVEs")
+    if internetdb.get("cves") and not is_cdn:
+        # Have real CVE IDs matched to a specific IP — look up the top one in NVD for details
+        cve_ids = internetdb["cves"][:10]
+        if verbose:
+            print(f"    internetdb CVEs: {cve_ids[:5]}")
+        top_detail = query_nvd_by_id(cve_ids[0])
+        if top_detail:
+            all_cves.append(top_detail)
+        # Add remaining as stubs (real IDs, CVSS unknown until looked up)
+        for cid in cve_ids[1:]:
+            all_cves.append({
+                "id": cid, "cvss_score": None,
+                "severity": "HIGH", "keyword": cid, "description": "",
+            })
+        data_source = "live_scan"
+    else:
+        # Fall back to NVD keyword search against detected tech stack
+        for t in tech[:6]:
+            cves = query_nvd(t)
+            all_cves.extend(cves)
+            if verbose and cves:
+                print(f"    nvd '{t}': {len(cves)} CVEs")
+        data_source = "inferred"
+
     top_cve = get_top_cve(all_cves)
 
-    # HIBP
+    # 8. CISA KEV cross-reference — flags actively exploited CVEs
+    kev = load_cisa_kev()
+    exploited = bool(top_cve and top_cve.get("id") in kev)
+    if exploited:
+        print(f"    CISA KEV: {top_cve['id']} is actively exploited in the wild")
+
+    # 9. HIBP breach lookup
     breaches = query_hibp(domain, hibp_key)
     breach   = breaches[0] if breaches else None
 
-    # Tag
+    # 10. Tag
     if top_cve:
         tag = "has_cve"
     elif breach:
@@ -533,43 +761,51 @@ def analyze_lead(lead: dict, hibp_key: str = "", verbose: bool = False) -> dict:
     else:
         tag = "no_findings"
 
-    ports_str   = ",".join(str(p) for p in censys["ports"][:5]) or "unknown"
-    service_str = (censys["services"] or tech or ["unknown"])[0]
+    ports_str   = ",".join(str(p) for p in internetdb["ports"][:5]) or "unknown"
+    service_str = (internetdb.get("services") or tech or ["unknown"])[0]
 
     variables = {
-        "cvss_score":      str(top_cve["cvss_score"]) if top_cve and top_cve.get("cvss_score") else "",
-        "key_risk":        top_cve["severity"]        if top_cve and top_cve.get("severity")   else "",
-        "exposed_ports":   ports_str,
-        "top_cve":         top_cve["id"]              if top_cve else "",
-        "key_cve":         top_cve["id"]              if top_cve else "",
-        "exposed_service": service_str,
-        "breach_date":     breach["date"]             if breach  else "",
-        "compliance_flag": "GDPR breach flagged"      if breach  else "",
-        "ssl_grade":       ssl.get("grade", ""),
-        "domain_age":      f"{whois['age_days'] // 365}y" if whois.get("age_days") else "",
-        "lemlistTag":      tag,
+        "cvss_score":        str(top_cve["cvss_score"]) if top_cve and top_cve.get("cvss_score") else "",
+        "key_risk":          top_cve["severity"]        if top_cve and top_cve.get("severity")   else "",
+        "exposed_ports":     ports_str,
+        "top_cve":           top_cve["id"]              if top_cve else "",
+        "key_cve":           top_cve["id"]              if top_cve else "",
+        "exposed_service":   service_str,
+        "breach_date":       breach["date"]             if breach  else "",
+        "compliance_flag":   "GDPR breach flagged"      if breach  else "",
+        "ssl_grade":         ssl.get("grade", ""),
+        "domain_age":        f"{whois['age_days'] // 365}y" if whois.get("age_days") else "",
+        "exploited_in_wild": "Yes — CISA KEV"           if exploited else "",
+        "lemlistTag":        tag,
     }
 
     print(f"    tag: {tag}", end="")
     if top_cve and top_cve.get("cvss_score"):
         print(f"  |  {top_cve['id']} CVSS {top_cve['cvss_score']}", end="")
+    elif top_cve:
+        print(f"  |  {top_cve['id']}", end="")
+    if exploited:
+        print(f"  |  CISA KEV (actively exploited)", end="")
     if breach:
         print(f"  |  breach {breach['date']}", end="")
     print()
 
     return {
         **lead,
-        "tech_stack":  tech,
-        "top_cve":     top_cve,
-        "cve_count":   len(all_cves),
-        "breaches":    breaches,
-        "tag":         tag,
-        "data_source": censys["data_source"],
-        "ssl_grade":   ssl.get("grade", ""),
-        "cert_expiry": ssl.get("cert_expiry", ""),
-        "domain_age":  whois.get("age_days"),
-        "registrar":   whois.get("registrar", ""),
-        "variables":   variables,
+        "tech_stack":        tech,
+        "top_cve":           top_cve,
+        "cve_count":         len(all_cves),
+        "breaches":          breaches,
+        "tag":               tag,
+        "data_source":       data_source,
+        "ssl_grade":         ssl.get("grade", ""),
+        "cert_expiry":       ssl.get("cert_expiry", ""),
+        "domain_age":        whois.get("age_days"),
+        "registrar":         whois.get("registrar", ""),
+        "internetdb_ip":     internetdb.get("ip", ""),
+        "internetdb_cves":   internetdb.get("cves", []),
+        "exploited_in_wild": exploited,
+        "variables":         variables,
     }
 
 
@@ -578,7 +814,8 @@ def _empty_variables(tag: str) -> dict:
         "cvss_score": "", "key_risk": "", "exposed_ports": "unknown",
         "top_cve": "", "key_cve": "", "exposed_service": "unknown",
         "breach_date": "", "compliance_flag": "",
-        "ssl_grade": "", "domain_age": "", "lemlistTag": tag,
+        "ssl_grade": "", "domain_age": "",
+        "exploited_in_wild": "", "lemlistTag": tag,
     }
 
 
@@ -595,6 +832,7 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
     usable   = n_cve + n_breach
     rate     = usable / total if total else 0
     live     = sum(1 for r in results if r.get("data_source") == "live_scan")
+    n_kev    = sum(1 for r in results if r.get("exploited_in_wild"))
     mark     = "✓ above" if rate >= 0.60 else "✗ below"
 
     lines = [
@@ -609,21 +847,24 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
         f"| `has_breach` | {n_breach} |",
         f"| `no_findings` | {n_none} |",
         f"| Usable intel rate | {rate:.0%} — {mark} MVP threshold (60%) |",
-        f"| Live Censys scans | {live}/{total} |",
+        f"| Live scans (Shodan InternetDB) | {live}/{total} |",
+        f"| CISA KEV — actively exploited | {n_kev} |",
         f"| Writeback | {'yes' if writeback else 'dry run'} |",
         "",
         "## Lead Table",
-        "| Company | Domain | Tag | CVE | CVSS | SSL | Domain Age | Breach |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Company | Domain | Tag | CVE | CVSS | KEV | SSL | Domain Age | Breach |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
-        cve_id     = r["top_cve"]["id"]              if r.get("top_cve") else "—"
-        cvss       = str(r["top_cve"]["cvss_score"]) if r.get("top_cve") and r["top_cve"].get("cvss_score") else "—"
-        ssl_grade  = r.get("ssl_grade") or "—"
-        age        = f"{r['domain_age'] // 365}y" if r.get("domain_age") else "—"
-        breach     = r["variables"].get("breach_date") or "—"
+        cve_id    = r["top_cve"]["id"]              if r.get("top_cve") else "—"
+        cvss      = str(r["top_cve"]["cvss_score"]) if r.get("top_cve") and r["top_cve"].get("cvss_score") else "—"
+        kev_flag  = "⚠ KEV"                         if r.get("exploited_in_wild") else "—"
+        ssl_grade = r.get("ssl_grade") or "—"
+        age       = f"{r['domain_age'] // 365}y"    if r.get("domain_age") else "—"
+        breach    = r["variables"].get("breach_date") or "—"
         lines.append(
-            f"| {r['company']} | {r.get('domain','—')} | `{r['tag']}` | {cve_id} | {cvss} | {ssl_grade} | {age} | {breach} |"
+            f"| {r['company']} | {r.get('domain','—')} | `{r['tag']}` "
+            f"| {cve_id} | {cvss} | {kev_flag} | {ssl_grade} | {age} | {breach} |"
         )
 
     lines += ["", "---", "", "## Lead Details"]
@@ -639,6 +880,15 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
         tech = r.get("tech_stack", [])
         if tech:
             lines.append(f"**Tech stack:** {', '.join(tech[:6])}")
+
+        # InternetDB live scan info
+        if r.get("internetdb_ip"):
+            idb_cves = r.get("internetdb_cves", [])
+            idb_note = f"IP `{r['internetdb_ip']}`"
+            if idb_cves:
+                idb_note += f" — {len(idb_cves)} CVEs from Shodan: {', '.join(idb_cves[:5])}"
+            lines.append(f"**InternetDB:** {idb_note}")
+
         meta_parts = []
         if r.get("ssl_grade"):
             expiry = f" (expires {r['cert_expiry']})" if r.get("cert_expiry") else ""
@@ -648,26 +898,34 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
             meta_parts.append(f"domain age **{r['domain_age'] // 365}y**{reg}")
         if meta_parts:
             lines.append("**Recon:** " + "  |  ".join(meta_parts))
+
         if r.get("top_cve"):
             c = r["top_cve"]
+            kev_badge = " 🚨 **CISA KEV — actively exploited**" if r.get("exploited_in_wild") else ""
+            cvss_str  = f"CVSS **{c['cvss_score']}** ({c.get('severity', '?')})" if c.get("cvss_score") else f"({c.get('severity', 'HIGH')})"
             lines += [
                 f"**CVE:** [{c['id']}](https://nvd.nist.gov/vuln/detail/{c['id']}) "
-                f"— CVSS **{c.get('cvss_score', '?')}** ({c.get('severity', '?')})",
-                f"> {c.get('description', '')[:250]}",
+                f"— {cvss_str}{kev_badge}",
             ]
+            if c.get("description"):
+                lines.append(f"> {c['description'][:250]}")
+
         if v.get("breach_date"):
             lines.append(f"**Breach:** {v['breach_date']} — {v.get('compliance_flag', '')}")
+
         lines += [
             "",
             "**Lemlist variables:**",
             f"  `{{{{cvss_score}}}}` = {v['cvss_score'] or '(empty)'}",
             f"  `{{{{key_cve}}}}` = {v['key_cve'] or '(empty)'}",
+            f"  `{{{{key_risk}}}}` = {v['key_risk'] or '(empty)'}",
             f"  `{{{{exposed_service}}}}` = {v['exposed_service']}",
             f"  `{{{{exposed_ports}}}}` = {v['exposed_ports']}",
             f"  `{{{{ssl_grade}}}}` = {v['ssl_grade'] or '(empty)'}",
             f"  `{{{{domain_age}}}}` = {v['domain_age'] or '(empty)'}",
             f"  `{{{{breach_date}}}}` = {v['breach_date'] or '(empty)'}",
             f"  `{{{{compliance_flag}}}}` = {v['compliance_flag'] or '(empty)'}",
+            f"  `{{{{exploited_in_wild}}}}` = {v['exploited_in_wild'] or '(empty)'}",
             "",
         ]
     return "\n".join(lines)
@@ -693,10 +951,15 @@ def main():
 
     if not os.getenv("NVD_API_KEY"):
         print("Note: NVD_API_KEY not set — slow mode (~7min). Free key: nvd.nist.gov\n")
-    if not _censys_auth():
-        print("Note: Censys keys not set — live scanning disabled. Free: censys.io/account/api\n")
+    if not os.getenv("VIRUSTOTAL_API_KEY"):
+        print("Note: VIRUSTOTAL_API_KEY not set — VT tech hints disabled (HTTP fingerprinting still runs)\n")
 
-    print(f"Fetching leads from campaign {args.campaign}...")
+    # Pre-load CISA KEV catalog (cached for the run)
+    print("Loading CISA Known Exploited Vulnerabilities catalog...", end=" ", flush=True)
+    kev = load_cisa_kev()
+    print(f"{len(kev)} entries" if kev else "failed (continuing without KEV)")
+
+    print(f"\nFetching leads from campaign {args.campaign}...")
     leads = fetch_leads(args.campaign)
     if args.limit:
         leads = leads[:args.limit]
@@ -728,7 +991,10 @@ def main():
     n_cve    = sum(1 for r in results if r["tag"] == "has_cve")
     n_breach = sum(1 for r in results if r["tag"] == "has_breach")
     n_none   = sum(1 for r in results if r["tag"] == "no_findings")
-    print(f"Summary: {n_cve} CVE  |  {n_breach} breach  |  {n_none} no findings")
+    n_live   = sum(1 for r in results if r.get("data_source") == "live_scan")
+    n_kev    = sum(1 for r in results if r.get("exploited_in_wild"))
+    print(f"Summary: {n_cve} CVE  |  {n_breach} breach  |  {n_none} no findings  "
+          f"|  {n_live} live scans  |  {n_kev} CISA KEV")
 
 
 if __name__ == "__main__":

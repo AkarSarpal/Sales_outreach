@@ -1,8 +1,12 @@
-# Security-Enriched LinkedIn Outbound — Blueprint v3
+# Security-Enriched LinkedIn Outbound — Blueprint v4
 
-## What Changed from v2
+## What Changed from v3
 
-v2 assumed Phase 3 would be done via manual agent prompts asking Claude to query Shodan + NVD per company. v3 replaces that entirely with an automated Python script (`pipeline.py`) that runs in one command. Shodan and Censys are both unavailable as free data sources — Censys removed free programmatic API access in June 2026. NVD (CVEs) is the primary enrichment source; domain is resolved from the lead's work email rather than guessed from the company name.
+v3 replaced manual Claude prompts with `pipeline.py` but still relied on VirusTotal passive cache as the primary tech stack source, giving keyword-matched CVEs rather than version-accurate ones. v4 adds three free upgrades that require no new API keys:
+
+- **Shodan InternetDB** — resolves each domain to an IP and queries Shodan's free public endpoint. Returns real open ports and version-accurate CVE IDs matched to that specific IP. Replaces the need for Censys (removed June 2026) or Shodan paid for most leads.
+- **Direct HTTP fingerprinting** — `GET`s the domain and reads `Server:`/`X-Powered-By:`/HTML for tech stack. More current than any passive cache. VirusTotal is now fallback-only.
+- **CISA KEV cross-reference** — downloads CISA's Known Exploited Vulnerabilities catalog (free) and flags CVEs being actively exploited in the wild. Adds `{{exploited_in_wild}}` as a new Lemlist variable — strongest possible outreach signal.
 
 ---
 
@@ -11,8 +15,14 @@ v2 assumed Phase 3 would be done via manual agent prompts asking Claude to query
 ```
 ICP Sourcing (Claude Desktop + Lemlist MCP)
      ↓
-pipeline.py  ←  NVD CVE lookup + HIBP breach check
-             ←  VirusTotal tech hints + SSL Labs grade + Whois domain age
+pipeline.py  ←  Shodan InternetDB  — live ports + CVE IDs per IP (free, no key)
+             ←  Direct HTTP probe  — tech stack from headers + HTML (free, no key)
+             ←  CISA KEV catalog   — actively exploited CVE flag (free, no key)
+             ←  NVD REST API       — CVE details + CVSS scores
+             ←  VirusTotal         — passive tech hints (fallback only)
+             ←  SSL Labs           — cached SSL grade (free, no key)
+             ←  Whois CLI          — domain age (free, no key)
+             ←  HIBP               — breach history (optional, ~$4/mo)
      ↓
 --writeback  →  Lemlist custom variables per lead
      ↓
@@ -27,11 +37,11 @@ Monitor replies → iterate
 
 Connect Lemlist to Claude Desktop.
 
-1. Add the Lemlist MCP server to `claude_desktop_config.json`
+1. Add the Lemlist MCP server to `~/Library/Application Support/Claude/claude_desktop_config.json`
 2. Restart Claude Desktop and authenticate via OAuth (no API keys needed)
 3. Verify: *"List my active Lemlist campaigns"*
 
-The MCP is used for lead sourcing and monitoring. Enrichment is handled by `pipeline.py` directly.
+The MCP is used for lead sourcing and monitoring. Enrichment is handled by `pipeline.py` directly — the MCP is not required to run the pipeline.
 
 ---
 
@@ -40,19 +50,24 @@ The MCP is used for lead sourcing and monitoring. Enrichment is handled by `pipe
 **Prompt:**
 > "Find 50 [Job Title]s at [Industry] companies in [Geography] with [X–Y] employees. Deduplicate against my existing contacts. Create a campaign called 'Security Outbound V1' in Lemlist and import the leads."
 
-Start at 50 leads. QA enrichment quality before scaling.
+Start at 50 leads. Run the pipeline on a sample before scaling.
 
 ---
 
 ## Phase 3: Security Intel Pipeline
 
-Phase 3 is now a single command. No manual prompting needed.
+Phase 3 is a single command. No manual prompting needed.
 
 ### Setup (one-time)
 
 ```bash
+pip install requests
 cp .env.example .env
-# Fill in: LEMLIST_API_KEY (required), NVD_API_KEY (free, 5min, cuts runtime 7min → 40sec)
+# Required:  LEMLIST_API_KEY
+# Optional:  NVD_API_KEY      (free, 5min — cuts runtime 7min → 40sec)
+#            VIRUSTOTAL_API_KEY (free — used as fallback if HTTP probe fails)
+#            HIBP_API_KEY      (~$4/mo — enables breach angle and GDPR messaging)
+# No key needed for: Shodan InternetDB, CISA KEV, direct HTTP probe, SSL Labs, Whois
 ```
 
 ### Run
@@ -61,48 +76,59 @@ cp .env.example .env
 # Dry run — generates intel_report.md, no changes to Lemlist
 python pipeline.py
 
-# Push variables to Lemlist leads
+# Push variables to Lemlist leads (activate campaign in UI first)
 python pipeline.py --writeback
 
-# Test on 3 leads first
+# Test on 3 leads first, verbose output
 python pipeline.py --limit 3 -v
 ```
 
 ### What the pipeline does per lead
 
 1. **Fetch from Lemlist** — reads all leads + contacts from the campaign via API
-2. **Resolve domain** — uses the lead's work email domain (e.g. `erikjan@bureauveritas.com` → `bureauveritas.com`). No guessing.
-3. **Tech stack** — VirusTotal passive HTTP headers give real `Server:`/`X-Powered-By:` per domain. Falls back to common web stack defaults if no signal.
-4. **SSL + domain intel** — SSL Labs cached scan gives SSL grade (A–F) and cert expiry. Whois gives domain age and registrar.
-5. **CVE lookup** — queries NVD for HIGH/CRITICAL CVEs in the last 3 years matching the detected tech stack (up to 6 technologies). Adaptive rate limiting: 6.5s/req without key, 0.7s with free key.
-6. **Breach check** — queries HIBP for domain breaches in last 24 months (requires paid HIBP key).
-7. **Tag lead** — `has_cve`, `has_breach`, or `no_findings`
-8. **Write back** — with `--writeback`, patches these variables to each Lemlist lead:
+2. **Resolve domain** — from lead's work email (`john@bureauveritas.com` → `bureauveritas.com`). No guessing.
+3. **Direct HTTP fingerprint** — `GET https://domain`, parses `Server:`, `X-Powered-By:`, `X-Generator:` and HTML. Free, no key.
+4. **Shodan InternetDB** — resolves domain → IP, queries `internetdb.shodan.io/{ip}`. Returns open ports + version-accurate CVE IDs. Free, no key. Detects CDN and falls back gracefully.
+5. **VirusTotal** — fallback tech stack from passive HTTP headers when HTTP probe returns nothing.
+6. **SSL Labs** — cached SSL grade (A–F) and cert expiry. Free, no key.
+7. **Whois** — domain age and registrar. System CLI, no key.
+8. **CVE lookup** — if InternetDB has CVE IDs (live path): looks up top CVE in NVD by ID. If not (fallback): keyword searches NVD against detected tech stack.
+9. **CISA KEV** — cross-references found CVEs against CISA's actively-exploited list. Free, no key.
+10. **HIBP** — breach check per domain. Requires paid key.
+11. **Tag lead** — `has_cve`, `has_breach`, or `no_findings`
+12. **Write back** — with `--writeback`, patches variables to each Lemlist lead
 
-| Variable | Example value |
-|---|---|
-| `{{cvss_score}}` | `8.8` |
-| `{{key_cve}}` | `CVE-2024-38475` |
-| `{{key_risk}}` | `HIGH` |
-| `{{exposed_service}}` | `Apache HTTP Server` |
-| `{{exposed_ports}}` | `80,443,8080` |
-| `{{ssl_grade}}` | `B` |
-| `{{domain_age}}` | `12y` |
-| `{{breach_date}}` | `2024-03-15` |
-| `{{compliance_flag}}` | `GDPR breach flagged` |
+### Lemlist variables injected
 
-Each finding carries a `data_source` field (`live_scan` vs `inferred`) so you know which are verified.
+| Variable | Example | Source |
+|---|---|---|
+| `{{cvss_score}}` | `8.8` | NVD CVSS score |
+| `{{key_cve}}` | `CVE-2024-38475` | Top CVE ID |
+| `{{key_risk}}` | `HIGH` | CVE severity label |
+| `{{exposed_service}}` | `Apache HTTP Server` | Tech stack / InternetDB |
+| `{{exposed_ports}}` | `80,443,8080` | Shodan InternetDB (live) or `unknown` |
+| `{{ssl_grade}}` | `B` | SSL Labs cached scan |
+| `{{domain_age}}` | `12y` | Whois creation date |
+| `{{breach_date}}` | `2024-03-15` | HIBP (requires key) |
+| `{{compliance_flag}}` | `GDPR breach flagged` | Set when breach found |
+| `{{exploited_in_wild}}` | `Yes — CISA KEV` | Set when CVE is on CISA's KEV list |
+| `{{lemlistTag}}` | `has_cve` | Lead classification — drives message variant |
+
+Each finding carries `data_source: live_scan` (InternetDB had data) or `inferred` (keyword-matched fallback).
 
 ### Data sources
 
 | Source | What it gives | Cost | Status |
 |---|---|---|---|
-| NVD (nvd.nist.gov) | CVEs by tech keyword, CVSS scores | Free (key optional) | ✓ Active |
-| VirusTotal | Passive tech stack hints from HTTP headers | Free (500/day) | ✓ Active — key configured |
+| Shodan InternetDB | Live ports + version-accurate CVE IDs | Free, no key | ✓ Active |
+| Direct HTTP probe | Tech stack from headers + HTML | Free, no key | ✓ Active |
+| CISA KEV catalog | Actively exploited CVE flag | Free, no key | ✓ Active |
+| NVD (nvd.nist.gov) | CVE CVSS scores + descriptions | Free (key speeds up) | ✓ Active |
+| VirusTotal | Passive tech hints (fallback) | Free (500/day) | ✓ Active — key configured |
 | SSL Labs | SSL grade (A–F) + cert expiry | Free, no key | ✓ Active |
 | Whois | Domain age + registrar | Free, CLI | ✓ Active |
 | HIBP | Domain breach history | ~$4/mo | Optional — key not configured |
-| Shodan | Live port/service scanning, version banners | $69/mo | Not used |
+| Shodan (full) | Deep live port/service scanning | $69/mo | Not used — post-MVP |
 | Censys | Live port/service scanning | Free API removed June 2026 | Not available |
 
 ---
@@ -120,7 +146,11 @@ Recommended 4-step structure:
 
 ### Message Templates
 
-**Step 3 — CVE angle** (use when `lemlistTag = has_cve`):
+**Step 3 — CVE angle + CISA KEV** (use when `lemlistTag = has_cve` and `exploited_in_wild` is set):
+
+> "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found CVE {{key_cve}} (CVSS {{cvss_score}}) affecting {{exposed_service}} — and it's on CISA's list of vulnerabilities being actively exploited right now. Teams in [industry] are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
+
+**Step 3 — CVE angle** (use when `lemlistTag = has_cve`, no KEV flag):
 
 > "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found an active CVE ({{key_cve}}, CVSS {{cvss_score}}) affecting {{exposed_service}} that's still showing up in public scans. Teams in [industry] are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
 
@@ -136,12 +166,13 @@ Recommended 4-step structure:
 
 > "Didn't want this to get lost, {{firstName}}. If the timing's off, just say the word — otherwise I'm happy to share the full report."
 
-### Fallback tag logic
+### Tag logic
 
-Set these in Lemlist before activating the sequence:
-- `has_cve` — CVE-angle message (pipeline sets this automatically via `--writeback`)
-- `has_breach` — compliance-angle message
-- `no_findings` — generic ICP pain or deprioritize
+Set these conditions in Lemlist before activating the sequence:
+- `lemlistTag = has_cve` + `exploited_in_wild` set → KEV-angle message (strongest)
+- `lemlistTag = has_cve` → CVE-angle message
+- `lemlistTag = has_breach` → compliance-angle message
+- `lemlistTag = no_findings` → generic ICP pain or deprioritize
 
 ---
 
@@ -160,7 +191,7 @@ Always review AI-generated copy that references real CVE data before it goes liv
 python pipeline.py --writeback
 ```
 
-Run weekly or when new leads are added to the campaign. Updated scores overwrite the previous values in Lemlist automatically.
+Run weekly or when new leads are added. Updated scores overwrite the previous values in Lemlist automatically.
 
 ---
 
@@ -178,8 +209,10 @@ Before expanding or automating:
 
 ## What Comes After the MVP
 
-- Shodan paid ($69/mo) — live port scanning, version-accurate CVE matching
-- BuiltWith API — tech stack detection per domain for sharper CVE targeting
-- Lead scoring model — weight by: CVSS score + breach recency + regulated industry
-- GitHub Actions cron — weekly pipeline re-run + diff alert on new Critical/High CVEs
-- MCP sequence automation — automate tag-based message selection once angles are validated
+- **HIBP key (~$4/mo)** — unlocks breach angle, GDPR messaging, `has_breach` tag
+- **NVD free key** — cuts runtime 7min → 40sec
+- **Shodan paid ($69/mo)** — deeper live scanning, version-accurate banners for all hosts
+- **BuiltWith API** — full tech stack per domain including framework versions → sharper CVE targeting
+- **Lead scoring model** — weight by: CVSS score + CISA KEV flag + breach recency + regulated industry
+- **GitHub Actions cron** — weekly pipeline re-run + diff alert on new Critical/High CVEs
+- **MCP sequence automation** — automate tag-based message selection once angles are validated
