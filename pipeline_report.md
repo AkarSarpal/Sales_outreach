@@ -2,6 +2,49 @@
 
 ---
 
+## Session 4 — 6 July 2026
+
+### Account switch + full writeback run
+
+Switched to a new Lemlist account. New campaign: **Security Outbound V1** (`cam_YvrCNaEq7FojNNH3r`), 51 leads.
+
+**Bug fixed: `pipeline.py` was not loading `.env`**
+
+`pipeline.py` was using `os.getenv()` without ever calling `load_dotenv()`, so it relied on environment variables being pre-exported in the shell. Fixed by adding:
+
+```python
+from dotenv import load_dotenv
+load_dotenv()
+```
+
+`python-dotenv` (v1.2.2) was already installed. Without this fix, the pipeline exited immediately with `LEMLIST_API_KEY is not set` when run directly via `python pipeline.py`.
+
+**Run results (6 July 2026):**
+
+| Metric | Value |
+|---|---|
+| Leads loaded | 51 |
+| `has_cve` | 39 |
+| `no_findings` (no domain) | 12 |
+| Live scans (Shodan InternetDB) | 8 |
+| CISA KEV — actively exploited | 0 |
+| Writeback | 39/51 variables pushed |
+
+**Notable findings:**
+- Akabank (`akabank.de`) — 75 CVEs on IP from Shodan InternetDB
+- Gemakom (`gemakom.de`) — 6 version-accurate CVEs from InternetDB
+- Adeus (`adeus.com`) — 34 CVEs from InternetDB including 2026-dated entries
+
+**Writeback discovery:** Lemlist stores custom variables on the lead object (`GET /api/leads/{email}`), not the contact object (`GET /api/contacts/{id}`). The PATCH to `campaigns/{id}/leads/{email}` with flat JSON keys works — variables confirmed present on lead after writeback.
+
+**Cleanup needed before campaign activation:**
+- Remove "Example / example.com" placeholder lead from Lemlist
+- 12 leads with no domain get empty variables — review or remove before activating
+
+**`.env.example` corrected:** Real API keys were present in the committed template (regression from prior session). Replaced with placeholder values. Fixed typo `VIRUSTOTAL_API_KE` → `VIRUSTOTAL_API_KEY`.
+
+---
+
 ## Session 3 — 29 June 2026
 
 ### What Was Added — Free Reliability Upgrades (no new API keys)

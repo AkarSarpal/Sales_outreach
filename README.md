@@ -30,8 +30,8 @@ Monitor replies → iterate copy
 ## Quick Start
 
 ```bash
-# 1. Install dependency
-pip install requests
+# 1. Install dependencies
+pip install requests python-dotenv
 
 # 2. Copy and fill in env file
 cp .env.example .env
@@ -55,7 +55,7 @@ python pipeline.py --writeback
 ### Prerequisites
 
 - Python 3.10+
-- `requests` library (`pip install requests`)
+- `requests` and `python-dotenv` libraries (`pip install requests python-dotenv`)
 - `whois` CLI available on system (pre-installed on macOS/Linux)
 - A Lemlist account with at least one campaign containing leads
 

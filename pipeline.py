@@ -35,13 +35,15 @@ import requests
 from datetime import datetime, timedelta
 from pathlib import Path
 from base64 import b64encode
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-CAMPAIGN_ID = os.getenv("LEMLIST_CAMPAIGN_ID", "cam_D4cKonCgWRYoNiEDR")
+CAMPAIGN_ID = os.getenv("LEMLIST_CAMPAIGN_ID", "cam_YvrCNaEq7FojNNH3r")
 
 NVD_BASE        = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 HIBP_BASE       = "https://haveibeenpwned.com/api/v3"

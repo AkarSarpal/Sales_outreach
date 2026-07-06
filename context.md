@@ -4,14 +4,14 @@
 
 A security-enriched LinkedIn outbound system. The core idea: use real, public security and compliance data (CVEs, breaches, GDPR fines) to personalize cold outreach at the lead level. Lemlist handles delivery; a Python pipeline + Claude handles enrichment.
 
-## Current Campaign State (as of 29 June 2026)
+## Current Campaign State (as of 6 July 2026)
 
-- **Campaign:** Security Outbound V1 (`cam_D4cKonCgWRYoNiEDR`)
+- **Campaign:** Security Outbound V1 (`cam_YvrCNaEq7FojNNH3r`) — new Lemlist account
 - **Status:** Draft — 0 messages sent
-- **Leads:** 23 leads across 20 unique companies
-- **Pipeline runs completed:** 2 sessions (18 June, 24 June 2026)
-- **Blockers resolved:** 3 of 4 high-priority blockers have workarounds in place
-- **Remaining hard blocker:** Campaign not yet activated (no outreach sent)
+- **Leads:** 51 leads
+- **Pipeline runs completed:** 4 sessions (18 June, 24 June, 29 June, 6 July 2026)
+- **Blockers resolved:** 4 of 4 high-priority blockers have workarounds in place
+- **Remaining hard blocker:** Campaign not yet activated in Lemlist UI (writeback done, 39/51 variables live)
 
 ## Architecture
 
@@ -64,7 +64,8 @@ Each enrichment entry also carries a `data_source` field (`live_scan` vs `inferr
 
 ### HIGH — Campaign in Draft, 0 messages sent
 - **Impact:** All security intel gathered is unused until campaign is activated
-- **Action:** Activate in Lemlist UI (assign sender → activate), then run `python pipeline.py --writeback`
+- **State:** Writeback complete — 39/51 leads have variables. 12 skipped (no domain).
+- **Action:** Activate in Lemlist UI (assign sender → activate). Also remove the "Example / example.com" placeholder lead before activating.
 
 ### PARTIALLY RESOLVED — CVEs matched to generic tech defaults (inferred mode)
 - **Previous state:** CVEs matched to generic Apache/nginx/IIS defaults
@@ -107,7 +108,8 @@ Each enrichment entry also carries a `data_source` field (`live_scan` vs `inferr
 
 | Priority | Action | Effort | Status |
 |---|---|---|---|
-| **Now** | Activate campaign in Lemlist UI → run `python pipeline.py --writeback` | 15 min | Blocking |
+| **Now** | Remove "Example / example.com" placeholder lead from Lemlist | 1 min | Not done |
+| **Now** | Activate campaign in Lemlist UI (assign sender → activate) | 5 min | Blocking |
 | **Now** | Get free NVD API key (nvd.nist.gov) → add `NVD_API_KEY` to `.env` | 5 min | Not done |
 | **Soon** | HIBP API key (~$4/mo) → unlocks `breach_date`, `compliance_flag`, `has_breach` tag | 10 min | Not done |
 | **Later** | Shodan paid ($69/mo) — deeper live scanning for hosts behind CDN or not in InternetDB | — | Post-MVP |
