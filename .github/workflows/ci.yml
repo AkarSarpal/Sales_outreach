@@ -53,13 +53,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      # requirements-dev.txt pulls in requirements.txt (runtime deps) plus
+      # pytest, so this one install covers both what pipeline.py needs to
+      # import and what's needed to run the test suite below.
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements-dev.txt
 
-     # Step 3: the actual check. "run:" executes a shell command directly
+      # Step 3: the actual check. "run:" executes a shell command directly
       # (as opposed to "uses:", which calls someone else's packaged action).
-      # py_compile just parses the file and checks for syntax errors — it does
-      # NOT run the pipeline or call any external API, so this step is safe to
-      # run on every push and PR with no secrets and no network calls involved.
-      - name: Check pipeline.py imports cleanly
-        run: python -c "import pipeline"
+      # pytest imports pipeline.py (so a missing/broken import still fails
+      # this step) and then runs every test_*.py in tests/ against real
+      # assertions — no network calls or secrets involved, since the tests
+      # only exercise pure functions like get_top_cve() with fake data.
+      - name: Run unit tests
+        run: python -m pytest tests/ -v
