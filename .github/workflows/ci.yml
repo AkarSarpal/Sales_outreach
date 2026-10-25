@@ -67,3 +67,11 @@ jobs:
       # only exercise pure functions like get_top_cve() with fake data.
       - name: Run unit tests
         run: python -m pytest tests/ -v
+
+      # Step 4: scan requirements.txt against the Python Packaging Advisory
+      # Database for known published CVEs in the dependencies themselves
+      # (not your code). Unlike the steps above, this needs network access
+      # and can start failing later even with no code changes, if a new
+      # CVE is published against requests/python-dotenv.
+      - name: Audit dependencies for known vulnerabilities
+        run: pip-audit -r requirements.txt
