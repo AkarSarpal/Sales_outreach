@@ -53,10 +53,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Step 3: the actual check. "run:" executes a shell command directly
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+     # Step 3: the actual check. "run:" executes a shell command directly
       # (as opposed to "uses:", which calls someone else's packaged action).
       # py_compile just parses the file and checks for syntax errors — it does
       # NOT run the pipeline or call any external API, so this step is safe to
       # run on every push and PR with no secrets and no network calls involved.
-      - name: Check pipeline.py compiles
-        run: python -m py_compile pipeline.py
+      - name: Check pipeline.py imports cleanly
+        run: python -c "import pipeline"
