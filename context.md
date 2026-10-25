@@ -4,12 +4,12 @@
 
 A security-enriched LinkedIn outbound system. The core idea: use real, public security and compliance data (CVEs, breaches, GDPR fines) to personalize cold outreach at the lead level. Lemlist handles delivery; a Python pipeline + Claude handles enrichment.
 
-## Current Campaign State (as of 6 July 2026)
+## Current Campaign State (as of 23 October 2026)
 
 - **Campaign:** Security Outbound V1 (`cam_YvrCNaEq7FojNNH3r`) — new Lemlist account
 - **Status:** Draft — 0 messages sent
 - **Leads:** 51 leads
-- **Pipeline runs completed:** 4 sessions (18 June, 24 June, 29 June, 6 July 2026)
+- **Pipeline runs completed:** 4 sessions (18 June, 24 June, 29 June, 6 July 2026). Session 5 (23 Oct 2026) changed CVE selection + added `risky_ports` — not yet re-run against live leads
 - **Blockers resolved:** 4 of 4 high-priority blockers have workarounds in place
 - **Remaining hard blocker:** Campaign not yet activated in Lemlist UI (writeback done, 39/51 variables live)
 
@@ -54,9 +54,13 @@ A security-enriched LinkedIn outbound system. The core idea: use real, public se
 
 ## Lemlist Custom Variables (injected per lead)
 
-`{{cvss_score}}`, `{{key_cve}}`, `{{key_risk}}`, `{{exposed_service}}`, `{{exposed_ports}}`, `{{ssl_grade}}`, `{{domain_age}}`, `{{breach_date}}`, `{{compliance_flag}}`, `{{exploited_in_wild}}`, `{{lemlistTag}}`
+`{{cvss_score}}`, `{{key_cve}}`, `{{key_risk}}`, `{{exposed_service}}`, `{{exposed_ports}}`, `{{risky_ports}}`, `{{ssl_grade}}`, `{{domain_age}}`, `{{breach_date}}`, `{{compliance_flag}}`, `{{exploited_in_wild}}`, `{{lemlistTag}}`
 
 `{{exploited_in_wild}}` = `"Yes — CISA KEV"` when the top CVE is on CISA's actively-exploited list. This is the strongest signal for outreach copy — use it to add urgency to the CVE angle message.
+
+**Top CVE selection:** every CVE is checked against KEV. The top CVE is a KEV hit if there is one, otherwise the highest CVSS. On the live path, up to 5 InternetDB IDs are looked up in NVD (KEV-listed first) — previously only the first ID in InternetDB's list was scored.
+
+`{{risky_ports}}` = high-risk ports exposed to the internet (MySQL, RDP, SMB, Redis, MongoDB, etc.), e.g. `"3306 (MySQL)"`. Empty when none found or when the domain is CDN-fronted. Feeds the Step 4 exposed-port follow-up.
 
 Each enrichment entry also carries a `data_source` field (`live_scan` vs `inferred`) so downstream users know which findings are version-accurate vs keyword-matched.
 
@@ -96,6 +100,7 @@ Each enrichment entry also carries a `data_source` field (`live_scan` vs `inferr
 | `has_cve` | Reference specific CVE + CVSS score + exposed service |
 | `has_breach` | Reference breach date + GDPR enforcement climate |
 | `no_findings` | Generic ICP-pain message or deprioritize |
+| `risky_ports` set (any tag) | Step 4 follow-up names the exposed port |
 
 ## Key Constraints
 
@@ -109,6 +114,8 @@ Each enrichment entry also carries a `data_source` field (`live_scan` vs `inferr
 | Priority | Action | Effort | Status |
 |---|---|---|---|
 | **Now** | Remove "Example / example.com" placeholder lead from Lemlist | 1 min | Not done |
+| **Now** | Re-run `python pipeline.py --writeback` — Session 5 changed top-CVE selection and added `risky_ports` | 10 min | Not done |
+| **Now** | Update Lemlist templates to Blueprint v5 copy (no `[industry]` placeholder, fixed KEV line, new Step 4 port variant) | 10 min | Not done |
 | **Now** | Activate campaign in Lemlist UI (assign sender → activate) | 5 min | Blocking |
 | **Now** | Get free NVD API key (nvd.nist.gov) → add `NVD_API_KEY` to `.env` | 5 min | Not done |
 | **Soon** | HIBP API key (~$4/mo) → unlocks `breach_date`, `compliance_flag`, `has_breach` tag | 10 min | Not done |

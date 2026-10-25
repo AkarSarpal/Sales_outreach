@@ -2,6 +2,37 @@
 
 ---
 
+## Session 5 — 23 October 2026
+
+### Lead-CVE selection fix + risky-port signal
+
+Walked a hypothetical lead (dental group, Apache 2.4.49 on a bare IP, MySQL exposed) through every pipeline step. That surfaced three gaps, all now fixed.
+
+**Bug fixed: "top" CVE was just the first InternetDB ID, not the most severe**
+
+On the live path only `cve_ids[0]` was looked up in NVD. Every other ID was a stub with `cvss_score = None`, so `get_top_cve()` always returned the first ID in InternetDB's list. A 9.8 RCE could lose to a 7.5 just by sort order.
+
+- Up to `NVD_LIVE_LOOKUPS = 5` IDs are now looked up per lead, KEV-listed IDs first
+- `get_top_cve(cves, kev)` ranks: KEV hit → has a CVSS score → highest CVSS
+- Cost: up to 5 NVD calls per live lead instead of 1 (~33s/lead without an NVD key, ~4s with one). Another reason to get the free NVD key.
+
+**Bug fixed: KEV check only covered the top CVE**
+
+KEV is now checked across all CVEs, and a KEV hit is preferred as the top CVE. The inferred path also benefits: a KEV-listed keyword match now beats a higher-CVSS non-KEV one. Report shows `N on CISA KEV` per lead.
+
+**New variable: `{{risky_ports}}`** (12 variables total)
+
+InternetDB ports are matched against `RISKY_PORTS` (FTP, Telnet, SMB, MSSQL, MySQL, RDP, PostgreSQL, VNC, Redis, Elasticsearch, Memcached, MongoDB). Output e.g. `3306 (MySQL)`. Suppressed for CDN-fronted domains, since those ports belong to the CDN. Added to the report lead table, lead details, run summary and console summary. Tagging is unchanged.
+
+**Template fixes (`sales_draft_1.md` → Blueprint v5, `README.md`)**
+- `[industry]` removed from all templates. It isn't a Lemlist variable and would have been sent literally.
+- KEV template said `Found CVE {{key_cve}}`, which rendered as "CVE CVE-2021-…". Now `Found {{key_cve}}`.
+- New Step 4 follow-up variant for leads with `risky_ports` set.
+
+**Verification:** mocked end-to-end test (all network calls stubbed): live path picks the KEV-listed 9.8 over the first-listed ID, looks up exactly 5 IDs, `risky_ports = "3306 (MySQL)"`; CDN path suppresses risky ports and prefers the KEV keyword match; no-domain lead and report generation still work. Not yet re-run against the live campaign.
+
+---
+
 ## Session 4 — 6 July 2026
 
 ### Account switch + full writeback run

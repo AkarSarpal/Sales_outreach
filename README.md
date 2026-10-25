@@ -129,8 +129,8 @@ python pipeline.py --hibp-key <your_key> --writeback
 6. **VirusTotal tech stack** — only called when HTTP fingerprinting returned nothing and InternetDB has no data. Queries VT passive HTTP cache as a last resort for tech stack hints.
 7. **SSL Labs grade** — fetches a cached scan from SSL Labs (`fromCache=on`). Returns SSL grade (A–F) and certificate expiry. Never triggers a new scan; no key required.
 8. **Whois domain age** — shells to system `whois`, parses creation date across multiple formats. Returns domain age and registrar. Handles EU TLDs (`.de`, `.nl`, `.fr`, `.es`).
-9. **CVE lookup** — if InternetDB returned CVE IDs (live path): looks up the top CVE in NVD by ID for CVSS score and description. If no InternetDB data (fallback path): keyword searches NVD across up to 6 detected tech stack items.
-10. **CISA KEV cross-reference** — checks every found CVE against CISA's Known Exploited Vulnerabilities feed. A KEV hit means the CVE is being actively exploited in the wild — sets `exploited_in_wild = "Yes — CISA KEV"`.
+9. **CVE lookup** — if InternetDB returned CVE IDs (live path): looks up up to 5 of them in NVD by ID (`NVD_LIVE_LOOKUPS`), KEV-listed IDs first, for CVSS score and description. The rest are kept as unscored IDs. If no InternetDB data (fallback path): keyword searches NVD across up to 6 detected tech stack items.
+10. **CISA KEV cross-reference** — checks every found CVE against CISA's Known Exploited Vulnerabilities feed. A KEV hit means the CVE is being actively exploited in the wild. The top CVE is chosen as KEV hit first, then highest CVSS — sets `exploited_in_wild = "Yes — CISA KEV"` when the top CVE is on KEV.
 11. **HIBP breach check** — queries Have I Been Pwned for domain breaches in the last 24 months. Requires a paid API key (~$4/mo). Skipped silently if key is absent.
 12. **Tag the lead** — assigns one of three tags: `has_cve`, `has_breach`, or `no_findings`.
 13. **Write back to Lemlist** — with `--writeback`, patches all enriched variables to each Lemlist lead by email address.
@@ -143,11 +143,12 @@ These are available as `{{variable}}` tokens in Lemlist message templates after 
 
 | Variable | Example | What it is |
 |---|---|---|
-| `{{cvss_score}}` | `8.8` | CVSS base score of the highest-severity CVE found |
+| `{{cvss_score}}` | `8.8` | CVSS score of the top CVE (KEV-listed first, then highest CVSS) |
 | `{{key_cve}}` | `CVE-2024-38475` | CVE ID of the top finding |
 | `{{key_risk}}` | `HIGH` | Severity label of the top CVE |
 | `{{exposed_service}}` | `Apache HTTP Server` | Primary service associated with the CVE |
 | `{{exposed_ports}}` | `80,443,8080` | Detected open ports (live scan only; `unknown` in inferred mode) |
+| `{{risky_ports}}` | `3306 (MySQL)` | High-risk ports exposed to the internet — databases, RDP, SMB, Redis, etc. Empty if none or CDN-fronted |
 | `{{ssl_grade}}` | `B` | SSL Labs grade for the company domain |
 | `{{domain_age}}` | `12y` | Age of the company domain |
 | `{{breach_date}}` | `2024-03-15` | Date of most recent domain breach (HIBP, requires key) |
@@ -163,7 +164,7 @@ Generated on every run. Gitignored — never committed.
 
 Sections:
 - **Run Summary** — total leads, breakdown by tag, usable intel rate vs 60% MVP threshold, writeback status
-- **Lead Table** — one row per lead: company, domain, tag, CVE ID, CVSS score, SSL grade, domain age, breach date
+- **Lead Table** — one row per lead: company, domain, tag, CVE ID, CVSS score, KEV flag, risky ports, SSL grade, domain age, breach date
 - **Lead Details** — per-lead: tech stack detected, full CVE details with NVD link, SSL grade and cert expiry, domain age and registrar, breach info, and a preview of every Lemlist variable value
 
 To save a run snapshot:
@@ -221,24 +222,34 @@ Do this manually — no code needed. Recommended 4-step LinkedIn sequence:
 
 ### Message templates
 
-**Step 3 — CVE angle** (leads tagged `has_cve`):
-> "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found an active CVE ({{key_cve}}, CVSS {{cvss_score}}) affecting {{exposed_service}} that's still showing up in public scans. Teams in [industry] are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
+**Step 3 — CVE angle + CISA KEV** (leads tagged `has_cve` with `exploited_in_wild` set):
+> "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found {{key_cve}} (CVSS {{cvss_score}}) affecting {{exposed_service}} — and it's on CISA's list of vulnerabilities being actively exploited right now. Teams like yours are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
+
+**Step 3 — CVE angle** (leads tagged `has_cve`, no KEV flag):
+> "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found an active CVE ({{key_cve}}, CVSS {{cvss_score}}) affecting {{exposed_service}} that's still showing up in public scans. Teams like yours are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
 
 **Step 3 — Breach angle** (leads tagged `has_breach`):
-> "Hey {{firstName}} — {{companyName}} showed up in a breach dataset from {{breach_date}}. Given how actively GDPR enforcement is moving right now, a lot of [industry] teams are quietly auditing their exposure. Thought this might be timely."
+> "Hey {{firstName}} — {{companyName}} showed up in a breach dataset from {{breach_date}}. Given how actively GDPR enforcement is moving right now, a lot of teams handling customer data are quietly auditing their exposure. Thought this might be timely."
 
 **Step 3 — Generic fallback** (leads tagged `no_findings`):
-> "Hey {{firstName}} — we work with a lot of [industry] teams on reducing their external attack surface before it becomes an incident. Would it make sense to show you what we typically find in a 20-minute scan?"
+> "Hey {{firstName}} — we work with a lot of teams your size on reducing their external attack surface before it becomes an incident. Would it make sense to show you what we typically find in a 20-minute scan?"
 
 **Step 4 — Follow-up:**
 > "Didn't want this to get lost, {{firstName}}. If the timing's off, just say the word — otherwise I'm happy to share the full report."
 
+**Step 4 — Follow-up, exposed port variant** (use when `risky_ports` is not empty):
+> "Didn't want this to get lost, {{firstName}}. One more thing from the scan — {{risky_ports}} is reachable from the public internet, which usually isn't intentional. Happy to share the full report either way."
+
+Templates contain no hand-filled placeholders — every `{{token}}` is a Lemlist built-in or a pipeline variable, so nothing gets sent literally.
+
 ### Tag-based routing in Lemlist
 
 Set up tag conditions in the sequence before activating:
+- `lemlistTag = has_cve` + `exploited_in_wild` set → KEV-angle message (strongest)
 - `lemlistTag = has_cve` → CVE-angle message
 - `lemlistTag = has_breach` → compliance-angle message
 - `lemlistTag = no_findings` → generic ICP pain message
+- `risky_ports` not empty → Step 4 exposed-port follow-up instead of the generic one
 
 ---
 
@@ -310,6 +321,7 @@ Every result is labelled `data_source: inferred` or `live_scan`.
 | CISA KEV flag | High — directly from CISA feed | Cross-reference against KEV catalog |
 | Tech stack | High — direct HTTP headers | `GET domain`, parse `Server:`/`X-Powered-By:`/HTML |
 | Exposed ports | High when InternetDB has data | Shodan InternetDB (live) |
+| Risky ports | High when InternetDB has data and no CDN | InternetDB ports matched to a high-risk port list |
 | Breach data | High when HIBP key set | HIBP API |
 | SSL grade | High — SSL Labs cache | SSL Labs |
 | Domain age | High — direct from Whois | System `whois` CLI |
@@ -352,5 +364,5 @@ Validate these before expanding or automating:
 | `.env.example` | Key template — safe to commit |
 | `intel_report.md` | Generated per run — per-lead intel preview (gitignored) |
 | `context.md` | Live project state — architecture, blockers, pipeline status |
-| `sales_draft_1.md` | Blueprint v3 — phases, message templates, success criteria |
+| `sales_draft_1.md` | Blueprint v5 — phases, message templates, success criteria |
 | `pipeline_report.md` | Dev log — challenge resolutions and session history |

@@ -7,7 +7,7 @@ CVE and breach data, and optionally writes results back as Lemlist
 custom variables.
 
 Data sources (all free, no additional keys required):
-  - Shodan InternetDB  — live ports + CVE IDs per IP (no key)
+  - Shodan InternetDB  — live ports, risky-port flag + CVE IDs per IP (no key)
   - Direct HTTP        — tech stack from response headers + HTML
   - CISA KEV           — actively exploited CVE cross-reference (no key)
   - NVD                — CVE details and CVSS scores
@@ -71,6 +71,26 @@ _WHOIS_DATE_FMTS = [
 ]
 
 PERSONAL_EMAIL_DOMAINS = {"gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "icloud.com"}
+
+# Max InternetDB CVE IDs looked up in NVD per lead (live path).
+# KEV-listed IDs are looked up first; each lookup costs one NVD request.
+NVD_LIVE_LOOKUPS = 5
+
+# Ports that should never face the internet — databases, remote access, legacy protocols
+RISKY_PORTS = {
+    21:    "FTP",
+    23:    "Telnet",
+    445:   "SMB",
+    1433:  "MSSQL",
+    3306:  "MySQL",
+    3389:  "RDP",
+    5432:  "PostgreSQL",
+    5900:  "VNC",
+    6379:  "Redis",
+    9200:  "Elasticsearch",
+    11211: "Memcached",
+    27017: "MongoDB",
+}
 
 # Module-level cache for CISA KEV — loaded once per run
 _KEV_CACHE: set | None = None
@@ -572,9 +592,25 @@ def _extract_cvss(metrics: dict) -> tuple:
     return None, ""
 
 
-def get_top_cve(cves: list[dict]) -> dict | None:
-    scored = [c for c in cves if c.get("cvss_score") is not None]
-    return max(scored, key=lambda c: c["cvss_score"]) if scored else (cves[0] if cves else None)
+def get_top_cve(cves: list[dict], kev: set | None = None) -> dict | None:
+    """
+    Pick the CVE to lead outreach with. A CISA KEV hit beats a higher CVSS
+    score — "actively exploited" is the stronger signal. Within each group,
+    highest CVSS wins; unscored CVEs only win if nothing is scored.
+    """
+    if not cves:
+        return None
+    kev = kev or set()
+    return max(cves, key=lambda c: (
+        c.get("id") in kev,
+        c.get("cvss_score") is not None,
+        c.get("cvss_score") or 0,
+    ))
+
+
+def risky_ports(ports: list[int]) -> str:
+    """Format exposed high-risk ports, e.g. '3306 (MySQL), 3389 (RDP)'. Empty if none."""
+    return ", ".join(f"{p} ({RISKY_PORTS[p]})" for p in sorted(ports) if p in RISKY_PORTS)
 
 
 # ---------------------------------------------------------------------------
@@ -718,18 +754,21 @@ def analyze_lead(lead: dict, hibp_key: str = "", verbose: bool = False) -> dict:
     tech = http_tech or vt_tech or cpe_tech or TECH_STACK_DEFAULTS[:3]
 
     # 7. CVEs — live IDs from InternetDB (version-accurate) or keyword search (fallback)
+    kev = load_cisa_kev()
     all_cves = []
     if internetdb.get("cves") and not is_cdn:
-        # Have real CVE IDs matched to a specific IP — look up the top one in NVD for details
-        cve_ids = internetdb["cves"][:10]
+        # Have real CVE IDs matched to a specific IP. InternetDB order says nothing
+        # about severity, so look up several in NVD — KEV-listed IDs first.
+        cve_ids = internetdb["cves"]
+        kev_ids = [c for c in cve_ids if c in kev]
+        lookup  = (kev_ids + [c for c in cve_ids if c not in kev])[:NVD_LIVE_LOOKUPS]
         if verbose:
-            print(f"    internetdb CVEs: {cve_ids[:5]}")
-        top_detail = query_nvd_by_id(cve_ids[0])
-        if top_detail:
-            all_cves.append(top_detail)
-        # Add remaining as stubs (real IDs, CVSS unknown until looked up)
-        for cid in cve_ids[1:]:
-            all_cves.append({
+            print(f"    internetdb CVEs: {len(cve_ids)} ({len(kev_ids)} on KEV) — "
+                  f"NVD lookup: {lookup}")
+        for cid in cve_ids:
+            detail = query_nvd_by_id(cid) if cid in lookup else None
+            # Not looked up (or lookup failed): keep as stub — real ID, CVSS unknown
+            all_cves.append(detail or {
                 "id": cid, "cvss_score": None,
                 "severity": "HIGH", "keyword": cid, "description": "",
             })
@@ -743,11 +782,10 @@ def analyze_lead(lead: dict, hibp_key: str = "", verbose: bool = False) -> dict:
                 print(f"    nvd '{t}': {len(cves)} CVEs")
         data_source = "inferred"
 
-    top_cve = get_top_cve(all_cves)
-
-    # 8. CISA KEV cross-reference — flags actively exploited CVEs
-    kev = load_cisa_kev()
+    # 8. CISA KEV cross-reference — every CVE is checked; a KEV hit is preferred as top CVE
+    top_cve   = get_top_cve(all_cves, kev)
     exploited = bool(top_cve and top_cve.get("id") in kev)
+    n_kev     = sum(1 for c in all_cves if c.get("id") in kev)
     if exploited:
         print(f"    CISA KEV: {top_cve['id']} is actively exploited in the wild")
 
@@ -765,12 +803,17 @@ def analyze_lead(lead: dict, hibp_key: str = "", verbose: bool = False) -> dict:
 
     ports_str   = ",".join(str(p) for p in internetdb["ports"][:5]) or "unknown"
     service_str = (internetdb.get("services") or tech or ["unknown"])[0]
+    # CDN IPs reflect the CDN's ports, not the company's — don't attribute them
+    risky_str   = "" if is_cdn else risky_ports(internetdb["ports"])
+    if risky_str:
+        print(f"    risky ports exposed: {risky_str}")
 
     variables = {
         "cvss_score":        str(top_cve["cvss_score"]) if top_cve and top_cve.get("cvss_score") else "",
         "key_risk":          top_cve["severity"]        if top_cve and top_cve.get("severity")   else "",
         "exposed_ports":     ports_str,
-        "top_cve":           top_cve["id"]              if top_cve else "",
+        "risky_ports":       risky_str,
+        "top_cve":          top_cve["id"]              if top_cve else "",
         "key_cve":           top_cve["id"]              if top_cve else "",
         "exposed_service":   service_str,
         "breach_date":       breach["date"]             if breach  else "",
@@ -807,13 +850,14 @@ def analyze_lead(lead: dict, hibp_key: str = "", verbose: bool = False) -> dict:
         "internetdb_ip":     internetdb.get("ip", ""),
         "internetdb_cves":   internetdb.get("cves", []),
         "exploited_in_wild": exploited,
+        "kev_count":         n_kev,
         "variables":         variables,
     }
 
 
 def _empty_variables(tag: str) -> dict:
     return {
-        "cvss_score": "", "key_risk": "", "exposed_ports": "unknown",
+        "cvss_score": "", "key_risk": "", "exposed_ports": "unknown", "risky_ports": "",
         "top_cve": "", "key_cve": "", "exposed_service": "unknown",
         "breach_date": "", "compliance_flag": "",
         "ssl_grade": "", "domain_age": "",
@@ -835,6 +879,7 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
     rate     = usable / total if total else 0
     live     = sum(1 for r in results if r.get("data_source") == "live_scan")
     n_kev    = sum(1 for r in results if r.get("exploited_in_wild"))
+    n_risky  = sum(1 for r in results if r["variables"].get("risky_ports"))
     mark     = "✓ above" if rate >= 0.60 else "✗ below"
 
     lines = [
@@ -851,11 +896,12 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
         f"| Usable intel rate | {rate:.0%} — {mark} MVP threshold (60%) |",
         f"| Live scans (Shodan InternetDB) | {live}/{total} |",
         f"| CISA KEV — actively exploited | {n_kev} |",
+        f"| Risky ports exposed (DB / RDP / etc.) | {n_risky} |",
         f"| Writeback | {'yes' if writeback else 'dry run'} |",
         "",
         "## Lead Table",
-        "| Company | Domain | Tag | CVE | CVSS | KEV | SSL | Domain Age | Breach |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Company | Domain | Tag | CVE | CVSS | KEV | Risky Ports | SSL | Domain Age | Breach |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         cve_id    = r["top_cve"]["id"]              if r.get("top_cve") else "—"
@@ -864,9 +910,10 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
         ssl_grade = r.get("ssl_grade") or "—"
         age       = f"{r['domain_age'] // 365}y"    if r.get("domain_age") else "—"
         breach    = r["variables"].get("breach_date") or "—"
+        risky     = r["variables"].get("risky_ports") or "—"
         lines.append(
             f"| {r['company']} | {r.get('domain','—')} | `{r['tag']}` "
-            f"| {cve_id} | {cvss} | {kev_flag} | {ssl_grade} | {age} | {breach} |"
+            f"| {cve_id} | {cvss} | {kev_flag} | {risky} | {ssl_grade} | {age} | {breach} |"
         )
 
     lines += ["", "---", "", "## Lead Details"]
@@ -889,7 +936,11 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
             idb_note = f"IP `{r['internetdb_ip']}`"
             if idb_cves:
                 idb_note += f" — {len(idb_cves)} CVEs from Shodan: {', '.join(idb_cves[:5])}"
+            if r.get("kev_count"):
+                idb_note += f" — **{r['kev_count']} on CISA KEV**"
             lines.append(f"**InternetDB:** {idb_note}")
+        if v.get("risky_ports"):
+            lines.append(f"**Risky ports exposed:** {v['risky_ports']}")
 
         meta_parts = []
         if r.get("ssl_grade"):
@@ -923,6 +974,7 @@ def generate_report(results: list[dict], writeback: bool = False) -> str:
             f"  `{{{{key_risk}}}}` = {v['key_risk'] or '(empty)'}",
             f"  `{{{{exposed_service}}}}` = {v['exposed_service']}",
             f"  `{{{{exposed_ports}}}}` = {v['exposed_ports']}",
+            f"  `{{{{risky_ports}}}}` = {v.get('risky_ports') or '(empty)'}",
             f"  `{{{{ssl_grade}}}}` = {v['ssl_grade'] or '(empty)'}",
             f"  `{{{{domain_age}}}}` = {v['domain_age'] or '(empty)'}",
             f"  `{{{{breach_date}}}}` = {v['breach_date'] or '(empty)'}",
@@ -995,8 +1047,9 @@ def main():
     n_none   = sum(1 for r in results if r["tag"] == "no_findings")
     n_live   = sum(1 for r in results if r.get("data_source") == "live_scan")
     n_kev    = sum(1 for r in results if r.get("exploited_in_wild"))
+    n_risky  = sum(1 for r in results if r["variables"].get("risky_ports"))
     print(f"Summary: {n_cve} CVE  |  {n_breach} breach  |  {n_none} no findings  "
-          f"|  {n_live} live scans  |  {n_kev} CISA KEV")
+          f"|  {n_live} live scans  |  {n_kev} CISA KEV  |  {n_risky} risky ports")
 
 
 if __name__ == "__main__":

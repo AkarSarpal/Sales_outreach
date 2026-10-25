@@ -1,0 +1,62 @@
+# The display name for this workflow. Shows up in the "Actions" tab of the repo
+# and as the check name on pull requests. Purely cosmetic — pick anything readable.
+name: CI
+
+# "on:" defines which GitHub events start this workflow. You can list several.
+on:
+  # Run whenever commits are pushed to the "main" branch specifically.
+  # Without the "branches:" filter, push would fire on every branch, which is
+  # usually too noisy for a repo with feature branches.
+  push:
+    branches: [main]
+
+  # Run on every pull request, regardless of target branch. This is what shows
+  # the green/red check mark on a PR before it's merged — the main reason CI exists.
+  pull_request:
+
+  # Adds a manual "Run workflow" button in the Actions tab. Useful for testing
+  # the workflow itself without needing a push or PR, and it's the trigger type
+  # you'd use later for anything that shouldn't run automatically (like a real
+  # pipeline run) since a human has to deliberately click it.
+  workflow_dispatch:
+
+# "jobs:" is a map of job-id -> job-definition. Each job gets its own fresh
+# virtual machine and runs in parallel with other jobs unless you add "needs:".
+jobs:
+  # "sanity-check" is this job's id — used internally (e.g. in "needs:") and
+  # shown in the Actions UI. Can be any name; doesn't have to match the file name.
+  sanity-check:
+
+    # Which virtual machine image to run this job on. "ubuntu-latest" is the
+    # free, default choice — a blank Ubuntu VM with nothing of yours installed.
+    # Every tool this job needs (Python, git, etc.) has to be set up explicitly
+    # below, which is why the next two steps exist.
+    runs-on: ubuntu-latest
+
+    # "steps:" is an ordered list — they run top to bottom, and if one fails,
+    # the rest of the job stops by default.
+    steps:
+      # Step 1: get the repo's code onto the runner. The VM starts completely
+      # empty — it does NOT automatically have your repository checked out.
+      # "actions/checkout" is an official action from the Marketplace; "@v4"
+      # pins the version so the workflow doesn't silently change behavior later.
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Step 2: install Python on the runner. "uses:" calls a packaged action;
+      # "with:" passes it configuration — here, which Python version to install.
+      # ubuntu-latest has some Python preinstalled, but relying on "whatever
+      # happens to be there" means your CI results depend on GitHub's current
+      # image, which changes over time. Being explicit makes the build reproducible.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Step 3: the actual check. "run:" executes a shell command directly
+      # (as opposed to "uses:", which calls someone else's packaged action).
+      # py_compile just parses the file and checks for syntax errors — it does
+      # NOT run the pipeline or call any external API, so this step is safe to
+      # run on every push and PR with no secrets and no network calls involved.
+      - name: Check pipeline.py compiles
+        run: python -m py_compile pipeline.py

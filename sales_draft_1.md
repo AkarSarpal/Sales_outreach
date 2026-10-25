@@ -1,6 +1,15 @@
-# Security-Enriched LinkedIn Outbound — Blueprint v4
+# Security-Enriched LinkedIn Outbound — Blueprint v5
 
-## What Changed from v3
+## What Changed from v4
+
+v5 sharpens which finding leads the message and surfaces one new signal (no new API keys):
+
+- **Smarter top-CVE selection** — v4 only scored the *first* CVE ID InternetDB returned, so the "top" CVE was whichever sorted first, not the most severe. v5 looks up up to 5 IDs in NVD (KEV-listed IDs first) and picks the lead CVE as: CISA KEV hit → highest CVSS.
+- **KEV check on every CVE** — previously only the top CVE was checked against CISA KEV; now all CVEs are, so a KEV hit anywhere in the list is surfaced.
+- **New variable `{{risky_ports}}`** — flags databases / remote access exposed to the internet (MySQL 3306, RDP 3389, Redis 6379, MongoDB 27017, etc.), e.g. `3306 (MySQL)`. Suppressed for CDN-fronted domains. Used in a new Step 4 follow-up variant.
+- **Template fixes** — removed the `[industry]` placeholder (it isn't a Lemlist variable and would have been sent literally) and the doubled "CVE CVE-…" in the KEV template.
+
+## What Changed from v3 (v4)
 
 v3 replaced manual Claude prompts with `pipeline.py` but still relied on VirusTotal passive cache as the primary tech stack source, giving keyword-matched CVEs rather than version-accurate ones. v4 adds three free upgrades that require no new API keys:
 
@@ -92,8 +101,8 @@ python pipeline.py --limit 3 -v
 5. **VirusTotal** — fallback tech stack from passive HTTP headers when HTTP probe returns nothing.
 6. **SSL Labs** — cached SSL grade (A–F) and cert expiry. Free, no key.
 7. **Whois** — domain age and registrar. System CLI, no key.
-8. **CVE lookup** — if InternetDB has CVE IDs (live path): looks up top CVE in NVD by ID. If not (fallback): keyword searches NVD against detected tech stack.
-9. **CISA KEV** — cross-references found CVEs against CISA's actively-exploited list. Free, no key.
+8. **CVE lookup** — if InternetDB has CVE IDs (live path): looks up up to 5 of them in NVD by ID, KEV-listed IDs first. If not (fallback): keyword searches NVD against detected tech stack.
+9. **CISA KEV** — cross-references every found CVE against CISA's actively-exploited list. Top CVE = KEV hit first, then highest CVSS. Free, no key.
 10. **HIBP** — breach check per domain. Requires paid key.
 11. **Tag lead** — `has_cve`, `has_breach`, or `no_findings`
 12. **Write back** — with `--writeback`, patches variables to each Lemlist lead
@@ -107,6 +116,7 @@ python pipeline.py --limit 3 -v
 | `{{key_risk}}` | `HIGH` | CVE severity label |
 | `{{exposed_service}}` | `Apache HTTP Server` | Tech stack / InternetDB |
 | `{{exposed_ports}}` | `80,443,8080` | Shodan InternetDB (live) or `unknown` |
+| `{{risky_ports}}` | `3306 (MySQL)` | High-risk ports (DB, RDP, etc.) from InternetDB — empty if none or CDN-fronted |
 | `{{ssl_grade}}` | `B` | SSL Labs cached scan |
 | `{{domain_age}}` | `12y` | Whois creation date |
 | `{{breach_date}}` | `2024-03-15` | HIBP (requires key) |
@@ -148,23 +158,29 @@ Recommended 4-step structure:
 
 **Step 3 — CVE angle + CISA KEV** (use when `lemlistTag = has_cve` and `exploited_in_wild` is set):
 
-> "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found CVE {{key_cve}} (CVSS {{cvss_score}}) affecting {{exposed_service}} — and it's on CISA's list of vulnerabilities being actively exploited right now. Teams in [industry] are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
+> "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found {{key_cve}} (CVSS {{cvss_score}}) affecting {{exposed_service}} — and it's on CISA's list of vulnerabilities being actively exploited right now. Teams like yours are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
 
 **Step 3 — CVE angle** (use when `lemlistTag = has_cve`, no KEV flag):
 
-> "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found an active CVE ({{key_cve}}, CVSS {{cvss_score}}) affecting {{exposed_service}} that's still showing up in public scans. Teams in [industry] are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
+> "Hey {{firstName}} — did some research on {{companyName}} before reaching out. Found an active CVE ({{key_cve}}, CVSS {{cvss_score}}) affecting {{exposed_service}} that's still showing up in public scans. Teams like yours are often surprised how long these stay unpatched. Worth 15 min to show you what we found?"
 
 **Step 3 — Breach angle** (use when `lemlistTag = has_breach`):
 
-> "Hey {{firstName}} — {{companyName}} showed up in a breach dataset from {{breach_date}}. Given how actively GDPR enforcement is moving right now, a lot of [industry] teams are quietly auditing their exposure. Thought this might be timely."
+> "Hey {{firstName}} — {{companyName}} showed up in a breach dataset from {{breach_date}}. Given how actively GDPR enforcement is moving right now, a lot of teams handling customer data are quietly auditing their exposure. Thought this might be timely."
 
 **Step 3 — Generic fallback** (use when `lemlistTag = no_findings`):
 
-> "Hey {{firstName}} — we work with a lot of [industry] teams on reducing their external attack surface before it becomes an incident. Would it make sense to show you what we typically find in a 20-minute scan?"
+> "Hey {{firstName}} — we work with a lot of teams your size on reducing their external attack surface before it becomes an incident. Would it make sense to show you what we typically find in a 20-minute scan?"
 
 **Step 4 — Follow-up:**
 
 > "Didn't want this to get lost, {{firstName}}. If the timing's off, just say the word — otherwise I'm happy to share the full report."
+
+**Step 4 — Follow-up, exposed port variant** (use when `risky_ports` is not empty):
+
+> "Didn't want this to get lost, {{firstName}}. One more thing from the scan — {{risky_ports}} is reachable from the public internet, which usually isn't intentional. Happy to share the full report either way."
+
+Templates contain no hand-filled placeholders — every `{{token}}` is a Lemlist built-in or a pipeline variable, so nothing gets sent literally.
 
 ### Tag logic
 
@@ -173,6 +189,7 @@ Set these conditions in Lemlist before activating the sequence:
 - `lemlistTag = has_cve` → CVE-angle message
 - `lemlistTag = has_breach` → compliance-angle message
 - `lemlistTag = no_findings` → generic ICP pain or deprioritize
+- `risky_ports` not empty → Step 4 exposed-port follow-up instead of the generic one
 
 ---
 
